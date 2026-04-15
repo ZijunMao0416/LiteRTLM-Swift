@@ -6,8 +6,8 @@ import CLiteRTLM
 
 /// Swift wrapper for Google's LiteRT-LM on-device inference engine.
 ///
-/// Supports text generation (Session API) and multimodal vision inference
-/// (Conversation API) with `.litertlm` model files (e.g. Gemma 4 E2B).
+/// Supports text generation (Session API) and multimodal inference — vision
+/// and audio — (Conversation API) with `.litertlm` model files (e.g. Gemma 4 E2B).
 ///
 /// Thread safety: all C API calls are serialized on an internal dispatch queue.
 /// The class is `@unchecked Sendable` because OpaquePointers are only accessed
@@ -18,11 +18,14 @@ import CLiteRTLM
 /// let engine = LiteRTLMEngine(modelPath: modelURL)
 /// try await engine.load()
 ///
-/// // Text generation
+/// // Text
 /// let response = try await engine.generate(prompt: "Hello!", temperature: 0.7, maxTokens: 256)
 ///
 /// // Vision
-/// let caption = try await engine.vision(imageData: jpegData, prompt: "Describe this photo.", temperature: 0.7, maxTokens: 512)
+/// let caption = try await engine.vision(imageData: jpegData, prompt: "Describe this photo.")
+///
+/// // Audio
+/// let transcript = try await engine.audio(audioData: wavData, prompt: "Transcribe this audio.")
 /// ```
 @Observable
 public final class LiteRTLMEngine: @unchecked Sendable {
@@ -40,7 +43,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     public private(set) var status: Status = .notLoaded
 
-    /// Vision is available when the model is loaded — `.litertlm` embeds the vision encoder.
+    /// Whether the engine is ready for inference (text, vision, and audio).
     public var isReady: Bool { status == .ready }
 
     private let modelPath: URL
@@ -64,9 +67,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     deinit {
         let eng = engine
+        let ses = chatSession
+        let sesCfg = chatSessionConfig
         let queue = inferenceQueue
-        if eng != nil {
+        if eng != nil || ses != nil {
             queue.async {
+                if let s = ses { litert_lm_session_delete(s) }
+                if let c = sesCfg { litert_lm_session_config_delete(c) }
                 if let e = eng { litert_lm_engine_delete(e) }
             }
         }
@@ -75,10 +82,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     // MARK: - Lifecycle
 
     /// Load the `.litertlm` model. Call once, reuse for multiple inferences.
-    /// The vision encoder is embedded in the model file — no separate load step needed.
+    /// Vision and audio encoders are embedded in the model file — no separate load step needed.
     @MainActor
     public func load() async throws {
-        guard status != .ready else { return }
+        guard status != .ready && status != .loading else { return }
 
         status = .loading
         Self.log.info("Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend)")
@@ -101,7 +108,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_set_min_log_level(1)
 
                         guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, nil
+                            path, backendStr, backendStr, backendStr
                         ) else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
@@ -228,68 +235,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             throw LiteRTLMError.inferenceFailure("Failed to convert image to JPEG")
         }
 
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString + ".jpg")
+        let tempURL = Self.makeTempURL(extension: "jpg")
         try jpegData.write(to: tempURL)
 
-        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
-            self.inferenceQueue.async { [self] in
-                defer { try? FileManager.default.removeItem(at: tempURL) }
-                do {
-                    guard let eng = self.engine else { throw LiteRTLMError.modelNotLoaded }
-
-                    guard let sessionConfig = litert_lm_session_config_create() else {
-                        throw LiteRTLMError.inferenceFailure("Failed to create session config")
-                    }
-                    litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
-                    var samplerParams = LiteRtLmSamplerParams(
-                        type: kTopP, top_k: 40, top_p: 0.95,
-                        temperature: temperature, seed: 0
-                    )
-                    litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
-
-                    guard let convConfig = litert_lm_conversation_config_create(
-                        eng, sessionConfig, nil, nil, nil, false
-                    ) else {
-                        litert_lm_session_config_delete(sessionConfig)
-                        throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
-                    }
-
-                    guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
-                        litert_lm_conversation_config_delete(convConfig)
-                        litert_lm_session_config_delete(sessionConfig)
-                        throw LiteRTLMError.inferenceFailure("Failed to create conversation")
-                    }
-                    defer {
-                        litert_lm_conversation_delete(conversation)
-                        litert_lm_conversation_config_delete(convConfig)
-                        litert_lm_session_config_delete(sessionConfig)
-                    }
-
-                    let messageJSON = Self.buildVisionMessageJSON(
-                        imagePath: tempURL.path, text: prompt
-                    )
-
-                    guard let response = messageJSON.withCString({ msgPtr in
-                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
-                    }) else {
-                        throw LiteRTLMError.inferenceFailure("Vision inference returned no response")
-                    }
-                    defer { litert_lm_json_response_delete(response) }
-
-                    guard let responsePtr = litert_lm_json_response_get_string(response) else {
-                        throw LiteRTLMError.inferenceFailure("Vision response string is NULL")
-                    }
-
-                    let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-
-        return result
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [], imagePaths: [tempURL.path], text: prompt
+        )
+        return try await runConversationInference(
+            messageJSON: messageJSON,
+            tempURLs: [tempURL],
+            temperature: temperature,
+            maxTokens: maxTokens
+        )
     }
 
     /// Run vision inference on multiple images.
@@ -314,79 +271,143 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
 
         var tempURLs: [URL] = []
-        for (i, data) in imagesData.enumerated() {
-            guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
-                throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
+        do {
+            for (i, data) in imagesData.enumerated() {
+                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
+                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
+                }
+                let url = Self.makeTempURL(extension: "jpg")
+                try jpegData.write(to: url)
+                tempURLs.append(url)
             }
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent(UUID().uuidString + ".jpg")
-            try jpegData.write(to: url)
-            tempURLs.append(url)
+        } catch {
+            Self.cleanupTempFiles(tempURLs)
+            throw error
         }
 
-        let urlsToCleanup = tempURLs
-        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
-            self.inferenceQueue.async { [self, urlsToCleanup] in
-                defer {
-                    for url in urlsToCleanup {
-                        try? FileManager.default.removeItem(at: url)
-                    }
-                }
-                do {
-                    guard let eng = self.engine else { throw LiteRTLMError.modelNotLoaded }
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [], imagePaths: tempURLs.map(\.path), text: prompt
+        )
+        return try await runConversationInference(
+            messageJSON: messageJSON,
+            tempURLs: tempURLs,
+            temperature: temperature,
+            maxTokens: maxTokens
+        )
+    }
 
-                    guard let sessionConfig = litert_lm_session_config_create() else {
-                        throw LiteRTLMError.inferenceFailure("Failed to create session config")
-                    }
-                    litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
-                    var samplerParams = LiteRtLmSamplerParams(
-                        type: kTopP, top_k: 40, top_p: 0.95,
-                        temperature: temperature, seed: 0
-                    )
-                    litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
+    // MARK: - Audio (Conversation API)
 
-                    guard let convConfig = litert_lm_conversation_config_create(
-                        eng, sessionConfig, nil, nil, nil, false
-                    ) else {
-                        litert_lm_session_config_delete(sessionConfig)
-                        throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
-                    }
+    /// Supported audio formats for the `audio()` and `multimodal()` methods.
+    public enum AudioFormat: String, Sendable {
+        case wav, flac, mp3
+    }
 
-                    guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
-                        litert_lm_conversation_config_delete(convConfig)
-                        litert_lm_session_config_delete(sessionConfig)
-                        throw LiteRTLMError.inferenceFailure("Failed to create conversation")
-                    }
-                    defer {
-                        litert_lm_conversation_delete(conversation)
-                        litert_lm_conversation_config_delete(convConfig)
-                        litert_lm_session_config_delete(sessionConfig)
-                    }
-
-                    let messageJSON = Self.buildMultiImageMessageJSON(
-                        imagePaths: tempURLs.map(\.path), text: prompt
-                    )
-
-                    guard let response = messageJSON.withCString({ msgPtr in
-                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
-                    }) else {
-                        throw LiteRTLMError.inferenceFailure("Vision inference returned no response")
-                    }
-                    defer { litert_lm_json_response_delete(response) }
-
-                    guard let responsePtr = litert_lm_json_response_get_string(response) else {
-                        throw LiteRTLMError.inferenceFailure("Vision response string is NULL")
-                    }
-
-                    let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+    /// Run audio inference on a single audio file.
+    ///
+    /// Uses the Conversation API, which handles audio decoding and preprocessing
+    /// (resample to 16 kHz, convert to mel spectrogram) internally.
+    ///
+    /// - Parameters:
+    ///   - audioData: Raw audio bytes (WAV, FLAC, or MP3).
+    ///   - prompt: Text prompt (e.g., "Transcribe this audio.", "Summarize what is being said.").
+    ///   - format: Audio container format. Default `.wav`.
+    ///   - temperature: Sampling temperature. Default 0.7.
+    ///   - maxTokens: Maximum tokens to generate. Default 512.
+    /// - Returns: Generated text response.
+    public func audio(
+        audioData: Data,
+        prompt: String,
+        format: AudioFormat = .wav,
+        temperature: Float = 0.7,
+        maxTokens: Int = 512
+    ) async throws -> String {
+        try ensureReady()
+        guard !audioData.isEmpty else {
+            throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
 
-        return result
+        let tempURL = Self.makeTempURL(extension: format.rawValue)
+        try audioData.write(to: tempURL)
+
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [tempURL.path], imagePaths: [], text: prompt
+        )
+        return try await runConversationInference(
+            messageJSON: messageJSON,
+            tempURLs: [tempURL],
+            temperature: temperature,
+            maxTokens: maxTokens
+        )
+    }
+
+    /// Run multimodal inference combining audio, images, and text in a single query.
+    ///
+    /// Useful for tasks like "describe what's happening in this video" where you have
+    /// both the audio track and keyframes, or "does this photo match what the speaker describes?".
+    ///
+    /// - Parameters:
+    ///   - audioData: Array of raw audio bytes (WAV, FLAC, or MP3). Pass empty array to skip.
+    ///   - imagesData: Array of raw image bytes (JPEG, PNG, HEIC). Pass empty array to skip.
+    ///   - prompt: Text prompt about the audio and/or images.
+    ///   - temperature: Sampling temperature. Default 0.7.
+    ///   - maxTokens: Maximum tokens to generate. Default 1024.
+    ///   - maxImageDimension: Resize image long edge to this value. Default 1024.
+    /// - Returns: Generated text response.
+    public func multimodal(
+        audioData: [Data] = [],
+        audioFormat: AudioFormat = .wav,
+        imagesData: [Data] = [],
+        prompt: String,
+        temperature: Float = 0.7,
+        maxTokens: Int = 1024,
+        maxImageDimension: Int = 1024
+    ) async throws -> String {
+        try ensureReady()
+        guard !audioData.isEmpty || !imagesData.isEmpty else {
+            throw LiteRTLMError.inferenceFailure("No audio or image data provided")
+        }
+
+        var tempURLs: [URL] = []
+        var audioPaths: [String] = []
+        var imagePaths: [String] = []
+
+        do {
+            // Write audio files
+            for (i, data) in audioData.enumerated() {
+                guard !data.isEmpty else {
+                    throw LiteRTLMError.inferenceFailure("Audio data \(i + 1) is empty")
+                }
+                let url = Self.makeTempURL(extension: audioFormat.rawValue)
+                try data.write(to: url)
+                tempURLs.append(url)
+                audioPaths.append(url.path)
+            }
+
+            // Write image files
+            for (i, data) in imagesData.enumerated() {
+                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
+                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
+                }
+                let url = Self.makeTempURL(extension: "jpg")
+                try jpegData.write(to: url)
+                tempURLs.append(url)
+                imagePaths.append(url.path)
+            }
+        } catch {
+            Self.cleanupTempFiles(tempURLs)
+            throw error
+        }
+
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: audioPaths, imagePaths: imagePaths, text: prompt
+        )
+        return try await runConversationInference(
+            messageJSON: messageJSON,
+            tempURLs: tempURLs,
+            temperature: temperature,
+            maxTokens: maxTokens
+        )
     }
 
     // MARK: - Persistent Session (KV Cache Reuse)
@@ -521,16 +542,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 self.logSessionBenchmark(session)
             }
         }
-    }
-
-    // MARK: - Benchmark
-
-    /// Retrieve benchmark info from a session.
-    public struct BenchmarkInfo: Sendable {
-        public let initTime: Double
-        public let timeToFirstToken: Double
-        public let prefillTurns: [(tokenCount: Int, tokensPerSec: Double)]
-        public let decodeTurns: [(tokenCount: Int, tokensPerSec: Double)]
     }
 
     // MARK: - Private: Session-based Inference
@@ -721,7 +732,89 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Vision Helpers
+    // MARK: - Private: Conversation-based Inference (Vision / Audio / Multimodal)
+
+    /// Shared helper for all Conversation API calls (vision, audio, multimodal).
+    /// Handles session/conversation lifecycle and temp file cleanup.
+    private func runConversationInference(
+        messageJSON: String,
+        tempURLs: [URL],
+        temperature: Float,
+        maxTokens: Int
+    ) async throws -> String {
+        let urlsToCleanup = tempURLs
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
+            self.inferenceQueue.async { [self, urlsToCleanup] in
+                defer {
+                    for url in urlsToCleanup {
+                        try? FileManager.default.removeItem(at: url)
+                    }
+                }
+                do {
+                    guard let eng = self.engine else { throw LiteRTLMError.modelNotLoaded }
+
+                    guard let sessionConfig = litert_lm_session_config_create() else {
+                        throw LiteRTLMError.inferenceFailure("Failed to create session config")
+                    }
+                    litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
+                    var samplerParams = LiteRtLmSamplerParams(
+                        type: kTopP, top_k: 40, top_p: 0.95,
+                        temperature: temperature, seed: 0
+                    )
+                    litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
+
+                    guard let convConfig = litert_lm_conversation_config_create(
+                        eng, sessionConfig, nil, nil, nil, false
+                    ) else {
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
+                    }
+
+                    guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
+                        litert_lm_conversation_config_delete(convConfig)
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create conversation")
+                    }
+                    defer {
+                        litert_lm_conversation_delete(conversation)
+                        litert_lm_conversation_config_delete(convConfig)
+                        litert_lm_session_config_delete(sessionConfig)
+                    }
+
+                    guard let response = messageJSON.withCString({ msgPtr in
+                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    }) else {
+                        throw LiteRTLMError.inferenceFailure("Conversation returned no response")
+                    }
+                    defer { litert_lm_json_response_delete(response) }
+
+                    guard let responsePtr = litert_lm_json_response_get_string(response) else {
+                        throw LiteRTLMError.inferenceFailure("Response string is NULL")
+                    }
+
+                    let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    // MARK: - Media Helpers
+
+    /// Create a uniquely-named temp file URL.
+    nonisolated static func makeTempURL(extension ext: String) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "." + ext)
+    }
+
+    /// Remove temp files, ignoring errors (best-effort cleanup).
+    nonisolated static func cleanupTempFiles(_ urls: [URL]) {
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
 
     /// Convert any image format to JPEG and resize for vision inference.
     nonisolated static func prepareImageForVision(_ data: Data, maxDimension: Int = 1024) -> Data? {
@@ -770,28 +863,27 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return mutableData as Data
     }
 
-    nonisolated static func buildVisionMessageJSON(imagePath: String, text: String) -> String {
-        let message: [String: Any] = [
-            "role": "user",
-            "content": [
-                ["type": "image", "path": imagePath],
-                ["type": "text", "text": text]
-            ]
-        ]
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return #"{"role":"user","content":[{"type":"image","path":"\#(imagePath)"},{"type":"text","text":"\#(text)"}]}"#
+    /// Build a Conversation API JSON message with any combination of audio, images, and text.
+    nonisolated static func buildMultimodalMessageJSON(
+        audioPaths: [String],
+        imagePaths: [String],
+        text: String
+    ) -> String {
+        var contentItems: [[String: Any]] = []
+        for path in audioPaths {
+            contentItems.append(["type": "audio", "path": path])
         }
-        return jsonString
-    }
-
-    nonisolated static func buildMultiImageMessageJSON(imagePaths: [String], text: String) -> String {
-        var contentItems: [[String: Any]] = imagePaths.map { ["type": "image", "path": $0] }
+        for path in imagePaths {
+            contentItems.append(["type": "image", "path": path])
+        }
         contentItems.append(["type": "text", "text": text])
         let message: [String: Any] = ["role": "user", "content": contentItems]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return buildVisionMessageJSON(imagePath: imagePaths.first ?? "", text: text)
+            // Fallback: text-only, properly escaped via JSONSerialization
+            let fallback: [String: Any] = ["role": "user", "content": [["type": "text", "text": text]]]
+            let fallbackData = (try? JSONSerialization.data(withJSONObject: fallback)) ?? Data()
+            return String(data: fallbackData, encoding: .utf8) ?? "{}"
         }
         return jsonString
     }

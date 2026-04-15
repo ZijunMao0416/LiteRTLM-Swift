@@ -2,7 +2,7 @@
 
 Swift package for running [LiteRT-LM](https://ai.google.dev/edge/litert/lm) models on iOS. Wraps Google's C API in a clean, async/await Swift interface.
 
-Supports **text generation**, **vision (image understanding)**, and **streaming** with models like **Gemma 4 E2B**.
+Supports **text generation**, **vision (image understanding)**, **audio (speech/sound understanding)**, and **streaming** with models like **Gemma 4 E2B**.
 
 > **Note:** This is a community project, not an official Google product. The included `CLiteRTLM.xcframework` is built from Google's open-source [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) C API (Apache 2.0).
 
@@ -82,9 +82,18 @@ let caption = try await engine.vision(
     maxTokens: 512
 )
 print(caption)
+
+// 5. Audio (speech/sound understanding)
+let audioData = try Data(contentsOf: audioURL)
+let transcript = try await engine.audio(
+    audioData: audioData,  // WAV, FLAC, or MP3
+    prompt: "Transcribe this audio.",
+    maxTokens: 512
+)
+print(transcript)
 ```
 
-> **Important:** Text generation (`generate`, `generateStreaming`, `openSession`) requires Gemma 4's turn marker format in the prompt (see [Prompt Format](#gemma-4-prompt-format)). Vision (`vision`, `visionMultiImage`) takes plain text prompts — the Conversation API handles formatting internally.
+> **Important:** Text generation (`generate`, `generateStreaming`, `openSession`) requires Gemma 4's turn marker format in the prompt (see [Prompt Format](#gemma-4-prompt-format)). Vision, audio, and multimodal methods take plain text prompts — the Conversation API handles formatting internally.
 
 ## More Examples
 
@@ -105,6 +114,41 @@ let answer = try await engine.visionMultiImage(
     imagesData: [image1Data, image2Data],
     prompt: "Compare these two photos.",
     maxTokens: 1024
+)
+```
+
+### Audio Understanding
+
+Supports WAV, FLAC, and MP3. Audio is automatically resampled to 16 kHz mono internally.
+
+```swift
+let audioData = try Data(contentsOf: recordingURL)
+
+// Transcription (default format: .wav)
+let text = try await engine.audio(
+    audioData: audioData,
+    prompt: "Transcribe this audio."
+)
+
+// MP3 file
+let mp3Data = try Data(contentsOf: mp3URL)
+let summary = try await engine.audio(
+    audioData: mp3Data,
+    prompt: "Summarize what is being said.",
+    format: .mp3,
+    maxTokens: 1024
+)
+```
+
+### Combined Audio + Vision (Multimodal)
+
+Analyze audio and images together in a single query:
+
+```swift
+let response = try await engine.multimodal(
+    audioData: [audioTrackData],
+    imagesData: [keyframeData],
+    prompt: "Does the speaker's description match what's shown in the image?"
 )
 ```
 
@@ -205,6 +249,8 @@ struct EngineView: View {
 | `generateStreaming(prompt:temperature:maxTokens:)` | Streaming text generation |
 | `vision(imageData:prompt:temperature:maxTokens:maxImageDimension:)` | Single-image understanding. Plain text prompt |
 | `visionMultiImage(imagesData:prompt:temperature:maxTokens:maxImageDimension:)` | Multi-image understanding |
+| `audio(audioData:prompt:format:temperature:maxTokens:)` | Audio understanding (WAV, FLAC, MP3). Plain text prompt |
+| `multimodal(audioData:audioFormat:imagesData:prompt:temperature:maxTokens:maxImageDimension:)` | Combined audio + vision inference |
 | `openSession(temperature:maxTokens:)` | Open persistent session for multi-turn chat (KV cache reuse) |
 | `sessionGenerateStreaming(input:)` | Stream generation using persistent session |
 | `closeSession()` | Close persistent session, free KV cache |
@@ -283,7 +329,9 @@ Tell me more.
 │  │                 │  │                  │   │
 │  │ .generate()     │  │ .download()      │   │
 │  │ .vision()       │  │ .pause()         │   │
-│  │ .openSession()  │  │ .cancel()        │   │
+│  │ .audio()        │  │ .cancel()        │   │
+│  │ .multimodal()   │  │                  │   │
+│  │ .openSession()  │  │                  │   │
 │  └────────┬────────┘  └──────────────────┘   │
 │           │                                  │
 │     Serial DispatchQueue                     │
@@ -294,13 +342,13 @@ Tell me more.
 │   Session API          Conversation API      │
 │   (text in/out)        (multimodal JSON)     │
 │                                              │
-│   For text generation  For vision inference  │
-│   Raw prompt format    Handles image I/O     │
+│   For text generation  For vision / audio /  │
+│   Raw prompt format    multimodal inference  │
 └──────────────────────────────────────────────┘
 ```
 
 - **Session API** — raw text prompts via `InputData`. You control the prompt format. Used by `generate()`, `generateStreaming()`, `openSession()`.
-- **Conversation API** — JSON-based messages with image paths. Handles image decode/resize/patchify internally. Used by `vision()`, `visionMultiImage()`.
+- **Conversation API** — JSON-based messages with image/audio file paths. Handles image decode/resize/patchify and audio decode/resample/mel-spectrogram internally. Used by `vision()`, `visionMultiImage()`, `audio()`, `multimodal()`.
 - All C API calls are serialized on a single `DispatchQueue` for thread safety. LiteRT-LM supports only one active session at a time.
 
 ## Building the XCFramework from Source
