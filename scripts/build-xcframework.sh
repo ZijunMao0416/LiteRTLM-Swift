@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="$PROJECT_DIR/Frameworks/LiteRTLM.xcframework"
 WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 # Colors
 RED='\033[0;31m'
@@ -45,7 +46,27 @@ if [ ! -f "$LITERT_LM_DIR/c/BUILD" ]; then
     error "Invalid LiteRT-LM source directory: $LITERT_LM_DIR (missing c/BUILD)"
 fi
 
+# Resolve to absolute path (relative paths break after `cd` into the source dir)
+LITERT_LM_DIR="$(cd "$LITERT_LM_DIR" && pwd)"
+
 info "Using LiteRT-LM source at: $LITERT_LM_DIR"
+
+# ---------------------------------------------------------------------------
+# 1b. Patch upstream BUILD if needed
+# ---------------------------------------------------------------------------
+# The upstream c/BUILD loads `:ios_engine.bzl` which doesn't ship in the repo
+# yet. Without the stub, Bazel can't parse the BUILD file and ALL targets in
+# the package appear missing ("no such target").
+
+if [ ! -f "$LITERT_LM_DIR/c/ios_engine.bzl" ]; then
+    info "Creating stub ios_engine.bzl (missing from upstream)..."
+    cat > "$LITERT_LM_DIR/c/ios_engine.bzl" << 'STUB'
+"""Stub for ios_shared_engine macro (not yet published upstream)."""
+
+def ios_shared_engine(**kwargs):
+    pass
+STUB
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Check prerequisites
@@ -76,11 +97,23 @@ cd "$LITERT_LM_DIR"
 
 $BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib 2>&1 | tail -5
 
-DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
-if [ ! -f "$DEVICE_DYLIB" ]; then
-    error "Device build failed: $DEVICE_DYLIB not found"
+DEVICE_DYLIB_SRC="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
+if [ ! -f "$DEVICE_DYLIB_SRC" ]; then
+    error "Device build failed: $DEVICE_DYLIB_SRC not found"
 fi
-info "Device build OK: $(du -h "$DEVICE_DYLIB" | cut -f1)"
+info "Device build OK: $(du -h "$DEVICE_DYLIB_SRC" | cut -f1)"
+
+# Copy device dylib aside before sim build overwrites bazel-bin
+DEVICE_DYLIB="$WORK_DIR/libLiteRTLMEngine-device.dylib"
+cp "$DEVICE_DYLIB_SRC" "$DEVICE_DYLIB"
+
+# Also grab the GemmaModelConstraintProvider dylib if present
+CONSTRAINT_DYLIB=""
+if [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
+    CONSTRAINT_DYLIB="$WORK_DIR/libGemmaModelConstraintProvider.dylib"
+    cp "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" "$CONSTRAINT_DYLIB"
+    info "Found libGemmaModelConstraintProvider.dylib"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Build for iOS simulator (arm64)
@@ -90,27 +123,14 @@ info "Building for iOS simulator (arm64)..."
 
 $BAZEL_CMD build --config=ios_sim_arm64 //c:libLiteRTLMEngine.dylib 2>&1 | tail -5
 
-SIM_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
-if [ ! -f "$SIM_DYLIB" ]; then
-    error "Simulator build failed: $SIM_DYLIB not found"
+SIM_DYLIB_SRC="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
+if [ ! -f "$SIM_DYLIB_SRC" ]; then
+    error "Simulator build failed: $SIM_DYLIB_SRC not found"
 fi
-info "Simulator build OK: $(du -h "$SIM_DYLIB" | cut -f1)"
+info "Simulator build OK: $(du -h "$SIM_DYLIB_SRC" | cut -f1)"
 
-# Copy simulator dylib aside (Bazel overwrites bazel-bin between configs)
-SIM_DYLIB_COPY="$WORK_DIR/libLiteRTLMEngine-sim.dylib"
-cp "$SIM_DYLIB" "$SIM_DYLIB_COPY"
-
-# Rebuild device to restore bazel-bin
-info "Restoring device build..."
-$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib 2>&1 | tail -3
-DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
-
-# Also grab the GemmaModelConstraintProvider dylib if present
-CONSTRAINT_DYLIB=""
-if [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
-    CONSTRAINT_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib"
-    info "Found libGemmaModelConstraintProvider.dylib"
-fi
+SIM_DYLIB="$WORK_DIR/libLiteRTLMEngine-sim.dylib"
+cp "$SIM_DYLIB_SRC" "$SIM_DYLIB"
 
 # ---------------------------------------------------------------------------
 # 5. Package as .framework bundles
@@ -189,7 +209,7 @@ info "Packaging device framework..."
 package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB"
 
 info "Packaging simulator framework..."
-package_framework "ios-arm64-simulator" "$SIM_DYLIB_COPY" ""
+package_framework "ios-arm64-simulator" "$SIM_DYLIB" ""
 
 # ---------------------------------------------------------------------------
 # 6. Create xcframework
@@ -225,9 +245,5 @@ done
 TOTAL_SIZE=$(du -sh "$OUTPUT_DIR" | cut -f1)
 info "Total xcframework size: $TOTAL_SIZE"
 
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
-
-rm -rf "$WORK_DIR"
 info "Done! xcframework is ready at Frameworks/LiteRTLM.xcframework"
+# WORK_DIR is cleaned up automatically by the EXIT trap

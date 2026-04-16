@@ -375,8 +375,9 @@ This repo ships a prebuilt `CLiteRTLM.xcframework`. If you want to build it your
 
 The script will:
 1. Clone (or use existing) [google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) source
-2. Build `libLiteRTLMEngine.dylib` for `ios_arm64` (device) and `ios_sim_arm64` (simulator)
-3. Package both into `Frameworks/LiteRTLM.xcframework`
+2. Patch missing `ios_engine.bzl` if needed (upstream BUILD references a file not yet published)
+3. Build `libLiteRTLMEngine.dylib` for `ios_arm64` (device) and `ios_sim_arm64` (simulator)
+4. Package both into `Frameworks/LiteRTLM.xcframework`
 
 ### Option B: Manual Step-by-Step
 
@@ -387,7 +388,22 @@ git clone https://github.com/google-ai-edge/LiteRT-LM.git
 cd LiteRT-LM
 ```
 
-#### 2. Build for iOS device (arm64)
+#### 2. Patch missing `ios_engine.bzl`
+
+The upstream `c/BUILD` loads `ios_engine.bzl` which is not yet published. Create a stub so Bazel can parse the BUILD file:
+
+```bash
+cat > c/ios_engine.bzl << 'EOF'
+"""Stub for ios_shared_engine macro (not yet published upstream)."""
+
+def ios_shared_engine(**kwargs):
+    pass
+EOF
+```
+
+> The build script (`Option A`) handles this automatically.
+
+#### 3. Build for iOS device (arm64)
 
 ```bash
 bazel build --config=ios_arm64 //c:libLiteRTLMEngine.dylib
@@ -399,7 +415,7 @@ The Bazel build target is defined in [`c/BUILD`](https://github.com/google-ai-ed
 - `linkshared = True` + `linkstatic = True` — produces a self-contained dylib with all C++ deps statically linked
 - `-Wl,-exported_symbol,_litert_lm_*` — only exports the public C API symbols
 
-#### 3. Build for iOS simulator (arm64)
+#### 4. Build for iOS simulator (arm64)
 
 ```bash
 # Save device dylib first (Bazel overwrites bazel-bin between configs)
@@ -418,7 +434,7 @@ Available iOS configs in `.bazelrc`:
 | `ios_x86_64` | x86_64 | Intel Mac simulator |
 | `ios_arm64e` | arm64e | A12+ with pointer auth |
 
-#### 4. Package as .framework bundles
+#### 5. Package as .framework bundles
 
 Each architecture needs to be wrapped in a `.framework` bundle before creating the xcframework.
 
@@ -492,7 +508,7 @@ codesign --force --sign - /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
 codesign --force --sign - /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
 ```
 
-#### 5. Create the xcframework
+#### 6. Create the xcframework
 
 ```bash
 xcodebuild -create-xcframework \
@@ -501,7 +517,7 @@ xcodebuild -create-xcframework \
     -output Frameworks/LiteRTLM.xcframework
 ```
 
-#### 6. Verify
+#### 7. Verify
 
 ```bash
 # Check architectures
@@ -520,6 +536,7 @@ nm -gU Frameworks/LiteRTLM.xcframework/ios-arm64/CLiteRTLM.framework/CLiteRTLM |
 
 | Issue | Solution |
 |-------|----------|
+| `no such target '//c:libLiteRTLMEngine.dylib'` | Create the stub `c/ios_engine.bzl` (see Step 2 above). The upstream BUILD loads a .bzl file that isn't published yet |
 | `no such package '@build_bazel_apple_support'` | Run `bazel sync` to fetch external dependencies |
 | Xcode SDK not found | Ensure Xcode is selected: `sudo xcode-select -s /Applications/Xcode.app` |
 | Build takes very long | First build downloads ~10 GB of deps. Subsequent builds use cache |
