@@ -119,7 +119,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
-                        litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
+                        litert_lm_engine_settings_set_max_num_tokens(settings, 8192)
 
                         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
                             .appendingPathComponent("litertlm_cache").path
